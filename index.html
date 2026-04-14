@@ -1083,8 +1083,11 @@ function renderSectorHeatmap() {
       '<div id="sh-chg-'+s.sym+'" style="font-size:13px;font-weight:700;margin-top:2px">—</div>'+
       '</div>';
   }).join('');
-  // Fetch quotes for all sectors in parallel
-  sectors.forEach(function(s) {
+  // Use chart API sequentially - this endpoint is CORS-allowed
+  var sIdx = 0;
+  function fetchNextSector() {
+    if (sIdx >= sectors.length) return;
+    var s = sectors[sIdx++];
     fetch('/api/q1/v8/finance/chart/'+s.sym+'?interval=1d&range=5d')
       .then(function(r){return r.json();})
       .then(function(d) {
@@ -1105,8 +1108,10 @@ function renderSectorHeatmap() {
           shEl.style.background = chgPct>=0?
             'rgba(0,212,170,'+intensity+')':'rgba(255,77,109,'+intensity+')';
         }
-      }).catch(function(){});
-  });
+      }).catch(function(){})
+      .finally(function(){ setTimeout(fetchNextSector, 250); });
+  }
+  fetchNextSector();
 }
 
 function drawLeaps() {
@@ -1610,8 +1615,10 @@ function drawHeatmap(info) {
   dtes.forEach(function(dte, di) {
     html += '<tr><td style="font-weight:600;color:var(--tx2)">' + dte + '天</td>';
     matrix[di].forEach(function(iv) {
+      var isReal = Object.keys(realIVmap).length > 0;
       var bg = clr(iv); var tc = iv >= (minIV + maxIV) / 2 ? '#fff' : '#0a0c10';
-      html += '<td style="background:' + bg + ';color:' + tc + '">' + iv + '%</td>';
+      var mark = isReal ? '' : '<span style="font-size:7px;opacity:0.5">~</span>';
+      html += '<td style="background:' + bg + ';color:' + tc + '">' + iv + '%' + mark + '</td>';
     });
     html += '</tr>';
   });
@@ -1624,10 +1631,34 @@ function drawHeatmap(info) {
 // ---- Skew chart ----
 function drawSkew(info) {
   dch('skew');
-  var base = (info || TICKERS[curTicker] || {baseIV: 0.3}).baseIV * 100;
   var mn = [-15,-10,-5,-2.5,0,2.5,5,10,15];
   var stk = mn.map(function(m) { return +(curPrice * (1 + m/100)).toFixed(0); });
-  var ivs = mn.map(function(m) { var sk = m < 0 ? 1+(-m/100)*1.5 : 1-(m/100)*0.5; return +(base*sk).toFixed(1); });
+  // Use real IV from nearest expiry in chainData
+  var ivs;
+  if (chainData && chainData.options && chainData.options[0] && curPrice > 0) {
+    var calls = chainData.options[0].calls || [];
+    var puts  = chainData.options[0].puts  || [];
+    ivs = stk.map(function(K) {
+      // Find matching call or put
+      var allOpts = calls.concat(puts);
+      var match = allOpts.reduce(function(best, o) {
+        if (!o.strike || !o.impliedVolatility || !o.impliedVolatility.raw) return best;
+        return Math.abs(o.strike.raw - K) < Math.abs((best.strike&&best.strike.raw||Infinity) - K) ? o : best;
+      }, {});
+      return match.impliedVolatility ? +(match.impliedVolatility.raw*100).toFixed(1) : null;
+    });
+    // Fill nulls with interpolation
+    ivs = ivs.map(function(v,i) {
+      if (v !== null) return v;
+      var prev = null, next = null;
+      for (var j=i-1;j>=0;j--) { if(ivs[j]!==null){prev=ivs[j];break;} }
+      for (var j=i+1;j<ivs.length;j++) { if(ivs[j]!==null){next=ivs[j];break;} }
+      return prev!==null ? prev : (next!==null ? next : 30);
+    });
+  } else {
+    var base = (info || TICKERS[curTicker] || {baseIV: 0.3}).baseIV * 100;
+    ivs = mn.map(function(m) { var sk = m < 0 ? 1+(-m/100)*1.5 : 1-(m/100)*0.5; return +(base*sk).toFixed(1); });
+  }
   var ctx = document.getElementById('skewChart').getContext('2d');
   CH['skew'] = new Chart(ctx, {
     type: 'line',
@@ -1807,233 +1838,141 @@ var HIST_MOVES = {
 
 // ---- Scanner ----
 function renderScanner() {
-  // ---- IV Rank: fetch sequentially with delay to avoid 401 rate limit ----
-  var scanTickers = userTickers.slice(0, 8).map(function(tk) {
-    return {ticker: tk, name: (TICKERS[tk] && TICKERS[tk].name) || tk};
-  });
+  // ---- IV Rank List: use chart API (CORS ok) not options API (401 on Vercel) ----
   var listEl = document.getElementById('ivRankList');
-  listEl.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">⟳ 正在拉取实时IV…</div>';
-  var ivResults = []; var ivDone = 0;
+  listEl.innerHTML = '<div style="text-align:center;padding:12px;color:var(--tx3);font-size:11px">⟳ 正在获取IV数据…</div>';
 
-  // Sequential with 300ms delay to avoid Yahoo rate limit
-  function fetchNextIV(idx) {
-    if (idx >= scanTickers.length) return;
-    var t = scanTickers[idx];
-    fetch('/api/q1/v7/finance/options/' + t.ticker)
-      .then(function(r) { return r.json(); })
-      .then(function(d) { pushIV(t, d, true); })
-      .catch(function()  { pushIV(t, null, false); })
-      .finally(function() {
-        setTimeout(function() { fetchNextIV(idx + 1); }, 350);
-      });
-  }
-  fetchNextIV(0);
+  var scanList = userTickers.slice(0, 10);
+  var ivResults = []; var done = 0;
 
-  function pushIV(t, d, fetched) {
-    var iv = null, price = 0;
-    if (fetched && d && d.optionChain && d.optionChain.result && d.optionChain.result[0]) {
-      var res = d.optionChain.result[0];
-      price = (res.quote && res.quote.regularMarketPrice) || 0;
-      if (price > 0 && res.options && res.options[0]) {
-        var calls = res.options[0].calls || [];
-        var atm = calls.reduce(function(b, c) {
-          return Math.abs((c.strike && c.strike.raw || 0) - price) <
-                 Math.abs((b.strike && b.strike.raw || 0) - price) ? c : b;
-        }, calls[0] || {});
-        if (atm && atm.impliedVolatility && atm.impliedVolatility.raw) {
-          iv = atm.impliedVolatility.raw * 100;
-        }
-      }
-    }
-    var baseInfo = TICKERS[t.ticker] || {baseIV: 0.35};
-    var ivF = iv != null ? iv : (baseInfo.baseIV * 100);
-    var lo = baseInfo.baseIV * 50, hi = baseInfo.baseIV * 180;
-    var rank = Math.min(99, Math.max(1, Math.round((ivF - lo) / (hi - lo) * 100)));
-    ivResults.push({ticker: t.ticker, name: t.name, rank: rank, iv: +ivF.toFixed(1),
-                    sig: rank > 60 ? '卖出' : '买入', isReal: iv != null});
-    ivDone++;
-    if (ivDone === scanTickers.length) {
-      ivResults.sort(function(a, b) { return b.rank - a.rank; });
-      var h1 = '';
-      ivResults.forEach(function(d) {
-        var bc = d.rank > 60 ? 'var(--red)' : 'var(--blu)';
-        var sc = d.sig === '卖出' ? 'ssel' : 'sbuy';
-        var src = d.isReal
-          ? '<span style="font-size:9px;color:var(--grn);margin-left:4px">●实时</span>'
-          : '<span style="font-size:9px;color:var(--tx3);margin-left:4px">●期限结构</span>';
-        h1 += '<div class="orow">';
-        h1 += '<div style="flex:1"><div class="otn">' + d.ticker + ' <span style="font-size:10px;color:var(--tx2);font-weight:400">' + d.name + '</span>' + src + '</div>';
-        h1 += '<div class="sivb"><div class="sivf" style="width:' + d.rank + '%;background:' + bc + '"></div></div>';
-        h1 += '<div class="od">IV Rank: ' + d.rank + ' | IV: ' + d.iv + '%</div></div>';
-        h1 += '<span class="sig ' + sc + '">' + d.sig + '机会</span></div>';
-      });
-      listEl.innerHTML = h1;
-    }
-  }
-
-
-  // ---- Volume Ratio Scanner ----
-var volRatioMinFilter = 1;
-
-function setVolRatioFilter(min, el) {
-  volRatioMinFilter = min;
-  document.querySelectorAll('.vrf-btn').forEach(function(b) {
-    b.style.background='var(--bg3)'; b.style.color='var(--tx2)'; b.style.borderColor='var(--bdr)';
-  });
-  if (el) { el.style.background='rgba(0,212,170,.15)'; el.style.color='var(--acc)'; el.style.borderColor='var(--acc)'; }
-  renderVolRatio();
-}
-
-function renderVolRatio() {
-  var el = document.getElementById('volRatioList');
-  if (!el || !chainData || !chainData.options) {
-    if (el) el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">加载期权链后自动显示</div>';
-    return;
-  }
-  var now = Date.now()/1000;
-  var items = [];
-  chainData.options.forEach(function(expOpts, ei) {
-    var expTs = allExpiries[ei]||0;
-    var dte   = Math.round((expTs - now)/86400);
-    var expLabel = expTs ? new Date(expTs*1000).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'}) : '?';
-    function scan(opts, type) {
-      opts.forEach(function(o) {
-        var vol = (o.volume&&o.volume.raw)||0;
-        var oi  = (o.openInterest&&o.openInterest.raw)||1;
-        var K   = (o.strike&&o.strike.raw)||0;
-        var ratio = vol/oi;
-        if (ratio < volRatioMinFilter || vol < 50) return;
-        var bid = (o.bid&&o.bid.raw)||0, ask = (o.ask&&o.ask.raw)||0;
-        var mid = bid&&ask?(bid+ask)/2:0;
-        var isOTM = type==='Call'?K>curPrice:K<curPrice;
-        var flowDir = ratio>5?'买入':'卖出';
-        var flowCol = flowDir==='买入'?'var(--grn)':'var(--red)';
-        var signal = ratio>=10?'极强':'强';
-        items.push({
-          label: curTicker+' '+type+' $'+K+' '+expLabel,
-          dte, vol, oi, ratio, mid, isOTM, flowDir, flowCol, signal, K
+  function pushResult(tk, iv, hv30, isReal) {
+    isReal = isReal || false;
+    var name = (TICKERS[tk] && TICKERS[tk].name) || tk;
+    var ivRankVal = null;
+    // Use term structure from current ticker's chainData if same ticker
+    if (tk === curTicker && chainData && chainData.options) {
+      var ivVals = [];
+      chainData.options.forEach(function(exp) {
+        (exp.calls||[]).forEach(function(call) {
+          var K = call.strike && call.strike.raw || 0;
+          if (curPrice > 0 && Math.abs(K-curPrice)/curPrice < 0.05 && call.impliedVolatility && call.impliedVolatility.raw > 0)
+            ivVals.push(call.impliedVolatility.raw*100);
         });
       });
+      if (ivVals.length >= 2) {
+        var lo = Math.min.apply(null,ivVals), hi = Math.max.apply(null,ivVals);
+        if (hi > lo) ivRankVal = Math.min(99, Math.max(1, Math.round((iv-lo)/(hi-lo)*100)));
+      }
     }
-    scan(expOpts.calls||[], 'Call');
-    scan(expOpts.puts||[],  'Put');
-  });
-  items.sort(function(a,b){return b.ratio-a.ratio;});
-  var top = items.slice(0,15);
-  if (!top.length) {
-    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">当前筛选条件(量比>'+volRatioMinFilter+'×)下无数据</div>';
-    return;
+    ivResults.push({ticker:tk, name:name, iv:+iv.toFixed(1), ivRank:ivRankVal, hv:hv30, isReal:isReal});
+    done++;
+    if (done === scanList.length) renderIVList();
   }
-  var html = '<table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">';
-  html += '<thead><tr style="color:var(--tx3)">';
-  html += '<th style="padding:4px 6px;text-align:left">合约</th>';
-  html += '<th style="padding:4px 6px;text-align:right">量比</th>';
-  html += '<th style="padding:4px 6px;text-align:right">成交量</th>';
-  html += '<th style="padding:4px 6px;text-align:right">OI</th>';
-  html += '<th style="padding:4px 6px;text-align:right">DTE</th>';
-  html += '<th style="padding:4px 6px;text-align:right">权利金</th>';
-  html += '<th style="padding:4px 6px;text-align:center">资金流向</th>';
-  html += '</tr></thead><tbody>';
-  top.forEach(function(d) {
-    var ratioColor = d.ratio>=10?'var(--red)':d.ratio>=5?'var(--amb)':'var(--acc)';
-    html += '<tr style="border-bottom:1px solid var(--bdr)">';
-    html += '<td style="padding:4px 6px;color:var(--tx)">'+d.label+'</td>';
-    html += '<td style="padding:4px 6px;text-align:right;color:'+ratioColor+';font-weight:700">×'+d.ratio.toFixed(1)+'</td>';
-    html += '<td style="padding:4px 6px;text-align:right">'+d.vol.toLocaleString()+'</td>';
-    html += '<td style="padding:4px 6px;text-align:right;color:var(--tx3)">'+d.oi.toLocaleString()+'</td>';
-    html += '<td style="padding:4px 6px;text-align:right;color:'+(d.dte<=7?'var(--red)':'var(--tx2)')+'">'+d.dte+'天</td>';
-    html += '<td style="padding:4px 6px;text-align:right;color:var(--amb)">'+(d.mid>0?'$'+d.mid.toFixed(2):'—')+'</td>';
-    html += '<td style="padding:4px 6px;text-align:center"><span style="padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700;background:'+d.flowCol+'22;color:'+d.flowCol+'">'+d.flowDir+'</span></td>';
-    html += '</tr>';
-  });
-  html += '</tbody></table>';
-  el.innerHTML = html;
-}
 
-// ---- Earnings: sequential fetch with delay to avoid 401 ----
-  var earTickers = userTickers.concat(['GOOGL','META','NVDA']).filter(function(t,i,a){return a.indexOf(t)===i;}).slice(0,10);
+  function renderIVList() {
+    ivResults.sort(function(a,b){return b.iv-a.iv;});
+    var h1 = '';
+    ivResults.forEach(function(d) {
+      var rankStr = d.ivRank !== null ? d.ivRank : '—';
+      var bc = (d.ivRank !== null && d.ivRank > 60) ? 'var(--red)' : 'var(--blu)';
+      var sig = (d.ivRank !== null && d.ivRank > 60) ? '卖出' : '买入';
+      var sc  = sig === '卖出' ? 'ssel' : 'sbuy';
+      var bar = Math.min(100, d.iv);
+      var src = d.isReal
+        ? '<span style="font-size:9px;color:var(--grn);margin-left:4px">●实时</span>'
+        : '<span style="font-size:9px;color:var(--amb);margin-left:4px">●缓存</span>';
+      h1 += '<div class="orow">';
+      h1 += '<div style="flex:1"><div class="otn">' + d.ticker + ' <span style="font-size:10px;color:var(--tx2);font-weight:400">' + d.name + '</span>' + src + '</div>';
+      h1 += '<div class="sivb"><div class="sivf" style="width:'+bar+'%;background:'+bc+'"></div></div>';
+      h1 += '<div class="od">IV: ' + d.iv + '% | IV Rank: ' + rankStr + (d.hv?(' | HV: '+(d.hv*100).toFixed(1)+'%'):'') + '</div></div>';
+      h1 += '<span class="sig ' + sc + '">' + sig + '机会</span></div>';
+    });
+    listEl.innerHTML = h1 || '<div style="padding:20px;text-align:center;color:var(--tx3)">暂无数据</div>';
+  }
+
+  // Use only cached TICKERS data - no external requests needed
+  // Real IV comes from loadData which already fetched chainData
+  scanList.forEach(function(t) {
+    var tk = t.ticker;
+    var iv   = (TICKERS[tk] && TICKERS[tk].baseIV) ? TICKERS[tk].baseIV * 100 : null;
+    var hv30 = (TICKERS[tk] && TICKERS[tk].hv)     ? TICKERS[tk].hv           : null;
+    var isReal = (TICKERS[tk] && TICKERS[tk].baseIV && TICKERS[tk]._realIV) ? true : false;
+    // For current ticker, use real ATM IV from chainData
+    if (tk === curTicker && chainData && chainData.options && chainData.options[0]) {
+      var calls = chainData.options[0].calls || [];
+      var atm = calls.reduce(function(b, cc) {
+        return Math.abs((cc.strike&&cc.strike.raw||0)-curPrice) <
+               Math.abs((b.strike&&b.strike.raw||0)-curPrice) ? cc : b;
+      }, calls[0]||{});
+      if (atm && atm.impliedVolatility && atm.impliedVolatility.raw) {
+        iv = atm.impliedVolatility.raw * 100;
+        isReal = true;
+      }
+      if (TICKERS[tk] && TICKERS[tk].hv) hv30 = TICKERS[tk].hv;
+    }
+    pushResult(tk, iv || 30, hv30, isReal);
+  });
+
+  // ---- Earnings: use quoteSummary only (no options fetch) ----
+  var earTickers = userTickers.concat(['GOOGL','META','NVDA']).filter(function(t,i,a){return a.indexOf(t)===i;}).slice(0,12);
   var earList = document.getElementById('earningsList');
   earList.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">⟳ 正在加载财报日期…</div>';
   var earResults = []; var earDone = 0;
 
-  function processEarTicker(tk, sumData, optData) {
-      var sumData = sumData, optData = optData;
-      var earTs = null, iv = null, price = 0;
-      if (sumData && sumData.quoteSummary && sumData.quoteSummary.result && sumData.quoteSummary.result[0]) {
-        var cal = sumData.quoteSummary.result[0].calendarEvents;
-        if (cal && cal.earnings && cal.earnings.earningsDate && cal.earnings.earningsDate[0]) {
-          earTs = cal.earnings.earningsDate[0].raw;
-        }
+  function processEar(tk, sumData) {
+    var earTs = null;
+    if (sumData && sumData.quoteSummary && sumData.quoteSummary.result && sumData.quoteSummary.result[0]) {
+      var cal = sumData.quoteSummary.result[0].calendarEvents;
+      if (cal && cal.earnings && cal.earnings.earningsDate && cal.earnings.earningsDate[0]) {
+        earTs = cal.earnings.earningsDate[0].raw;
       }
-      if (optData && optData.optionChain && optData.optionChain.result && optData.optionChain.result[0]) {
-        var r0 = optData.optionChain.result[0];
-        price = (r0.quote && r0.quote.regularMarketPrice) || 0;
-        if (price > 0 && r0.options && r0.options[0]) {
-          var calls = r0.options[0].calls || [];
-          var atm = calls.reduce(function(b, c) {
-            return Math.abs((c.strike && c.strike.raw || 0) - price) <
-                   Math.abs((b.strike && b.strike.raw || 0) - price) ? c : b;
-          }, calls[0] || {});
-          if (atm && atm.impliedVolatility && atm.impliedVolatility.raw) {
-            iv = atm.impliedVolatility.raw * 100;
-          }
-        }
-      }
-      var days = earTs ? Math.round((earTs - Date.now() / 1000) / 86400) : null;
-      var baseIV = (TICKERS[tk] || {baseIV: 0.35}).baseIV * 100;
-      var ivU = iv || baseIV;
-      var strPct = (days != null && days >= 0) ? +(ivU * Math.sqrt(Math.max(1, days) / 365) * 0.8).toFixed(1) : null;
-      var hist = HIST_MOVES[tk] || 5.0;
-      earResults.push({
-        ticker: tk, days: days,
-        dateStr: earTs ? new Date(earTs * 1000).toLocaleDateString('zh-CN', {month:'numeric', day:'numeric'}) : null,
-        priced: strPct, hist: hist,
-        sig: strPct != null ? (strPct < hist ? '买跨' : '卖跨') : '—',
-        isReal: !!earTs
-      });
-      earDone++;
-      if (earDone === earTickers.length) {
-        earResults = earResults.filter(function(d) { return d.days != null && d.days >= 0 && d.days <= 30; });
-        earResults.sort(function(a, b) { return a.days - b.days; });
-        var h2 = '';
-        earResults.forEach(function(d) {
-          var ratio = d.priced != null ? Math.min(100, (d.priced / d.hist) * 100) : 50;
-          var isBuy = d.sig === '买跨';
-          var fc = isBuy ? 'var(--blu)' : 'var(--red)';
-          var sc = isBuy ? 'sbuy' : 'ssel';
-          var dayLabel = d.isReal
-            ? (d.dateStr + ' <span style="color:var(--grn)">(+' + d.days + '天)</span>')
-            : ('约' + d.days + '天后 <span style="color:var(--amb)">●估算</span>');
-          h2 += '<div class="orow">';
-          h2 += '<div style="flex:1"><div class="otn">' + d.ticker + ' <span style="font-size:9px;color:var(--tx3)">财报 ' + dayLabel + '</span></div>';
-          h2 += '<div style="display:flex;gap:8px;font-size:10px;margin-top:3px"><span style="color:var(--red)">定价:' + (d.priced || '—') + '%</span><span style="color:var(--blu)">历史:' + d.hist + '%</span></div>';
-          h2 += '<div class="epb"><div class="pb"><div class="pf" style="width:' + ratio.toFixed(0) + '%;background:' + fc + '"></div></div><span style="font-size:9px;color:var(--tx3)">' + ratio.toFixed(0) + '%</span></div></div>';
-          h2 += '<span class="sig ' + sc + '" style="margin-left:10px">' + d.sig + '</span></div>';
-        });
-        if (!h2) h2 = '<div style="text-align:center;padding:20px;color:var(--tx3)">暂无近期财报</div>';
-        earList.innerHTML = h2;
-      }
+    }
+    var days = earTs ? Math.round((earTs - Date.now()/1000) / 86400) : null;
+    if (days === null || days < 0 || days > 30) { earDone++; checkEarDone(); return; }
+
+    var iv = (TICKERS[tk] && TICKERS[tk].baseIV) ? TICKERS[tk].baseIV * 100 : 35;
+    var price = curTicker === tk ? curPrice : 0;
+    var strPct = +(iv * Math.sqrt(Math.max(1, days) / 365) * 0.8).toFixed(1);
+    var hist = {TSLA:12,AAPL:5,AMZN:7,MSFT:5,SMCI:20,NVDA:9,GOOGL:6,META:8,RKLB:15,QQQ:3,DRAM:10}[tk] || 6;
+    var dateStr = new Date(earTs*1000).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'});
+    earResults.push({ticker:tk, days:days, dateStr:dateStr, priced:strPct, hist:hist,
+      sig: strPct < hist ? '买跨' : '卖跨', isReal:true});
+    earDone++;
+    checkEarDone();
   }
+
+  function checkEarDone() {
+    if (earDone < earTickers.length) return;
+    earResults.sort(function(a,b){return a.days-b.days;});
+    if (!earResults.length) {
+      earList.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3)">30天内暂无财报</div>';
+      return;
+    }
+    var h2 = '';
+    earResults.forEach(function(d) {
+      var ratio = Math.min(100,(d.priced/d.hist)*100);
+      var isBuy = d.sig === '买跨';
+      var fc = isBuy ? 'var(--blu)' : 'var(--red)';
+      var sc = isBuy ? 'sbuy' : 'ssel';
+      h2 += '<div class="orow">';
+      h2 += '<div style="flex:1"><div class="otn">' + d.ticker + ' <span style="font-size:9px;color:var(--grn)">财报 ' + d.dateStr + ' (+' + d.days + '天)</span></div>';
+      h2 += '<div style="display:flex;gap:8px;font-size:10px;margin-top:3px"><span style="color:var(--red)">定价:'+d.priced+'%</span><span style="color:var(--blu)">历史:'+d.hist+'%</span></div>';
+      h2 += '<div class="epb"><div class="pb"><div class="pf" style="width:'+ratio.toFixed(0)+'%;background:'+fc+'"></div></div><span style="font-size:9px;color:var(--tx3)">'+ratio.toFixed(0)+'%</span></div></div>';
+      h2 += '<span class="sig ' + sc + '" style="margin-left:10px">' + d.sig + '</span></div>';
+    });
+    earList.innerHTML = h2;
+  }
+
   function fetchNextEar(idx) {
     if (idx >= earTickers.length) return;
     var tk = earTickers[idx];
-    Promise.all([
-      fetch('/api/q1/v10/finance/quoteSummary/' + tk + '?modules=calendarEvents')
-        .then(function(r){return r.json();}).catch(function(){return null;}),
-      fetch('/api/q1/v7/finance/options/' + tk)
-        .then(function(r){return r.json();}).catch(function(){return null;})
-    ]).then(function(res) {
-      processEarTicker(tk, res[0], res[1]);
-    }).catch(function() {
-      processEarTicker(tk, null, null);
-    }).finally(function() {
-      setTimeout(function(){fetchNextEar(idx+1);}, 400);
-    });
+    fetch('/api/q1/v10/finance/quoteSummary/' + tk + '?modules=calendarEvents')
+      .then(function(r){return r.json();}).catch(function(){return null;})
+      .then(function(d){ processEar(tk, d); })
+      .finally(function(){ setTimeout(function(){fetchNextEar(idx+1);}, 300); });
   }
   fetchNextEar(0);
 }
-
-// ---- Unusual activity — corrected classification with DTE awareness ----
 
 function renderArbScanner() {
   var el = document.getElementById('arbList');
