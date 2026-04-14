@@ -802,32 +802,8 @@ function fetchChart(ticker) {
     });
 }
 
-// ---- quoteSummary: 获取 marketCap + 财报日期 ----
-// 这个端点有时允许跨域（取决于 Yahoo 服务器），失败也没关系
-function fetchSummary(ticker) {
-  var url = '/api/q1/v10/finance/quoteSummary/' + ticker
-    + '?modules=price%2CcalendarEvents';
-  return fetch(url, { headers: yahooHeaders })
-    .then(function(r) { if (!r.ok) throw new Error('summary ' + r.status); return r.json(); })
-    .then(function(d) {
-      var res = d.quoteSummary && d.quoteSummary.result && d.quoteSummary.result[0];
-      if (!res) return {};
-      var pr  = res.price || {};
-      var cal = res.calendarEvents || {};
-      var mc  = pr.marketCap && pr.marketCap.raw;
-      var earningsTs = null;
-      if (cal.earnings && cal.earnings.earningsDate && cal.earnings.earningsDate[0]) {
-        earningsTs = cal.earnings.earningsDate[0].raw;
-      }
-      return {
-        marketCap:   mc,
-        name:        pr.shortName || pr.longName || null,
-        earningsTs:  earningsTs,
-        volume:      pr.regularMarketVolume && pr.regularMarketVolume.raw
-      };
-    })
-    .catch(function() { return {}; }); // 静默失败，不影响主流程
-}
+// fetchSummary removed — quoteSummary returns 401 on Vercel IPs
+// marketCap/name comes from chart API; earnings from static calendar
 
 // ---- 期权链：直连 v7 options (需要 crumb) ----
 // Yahoo 的 v7/options 要求请求带 crumb 参数，crumb 值从浏览器 cookie 里读。
@@ -936,15 +912,14 @@ function loadData(ticker) {
   var info = TICKERS[ticker] || { name: ticker, baseIV: 0.35, hv: 0.28, mockPrice: 100 };
   var gotPrice = false;
 
-  // 并发请求：chart（必须）+ summary（补充）+ options（期权链）
+  // 并发请求：chart（必须）+ options（期权链）— 不再调用 quoteSummary（Vercel IP 401）
   Promise.all([
     fetchChart(ticker),
-    fetchSummary(ticker),
     fetchOptions(ticker)
   ]).then(function(results) {
     var chartData   = results[0];  // 一定有（否则进 catch）
-    var summaryData = results[1];  // 可能为空对象
-    var optData     = results[2];  // 可能为 null
+    var summaryData = {};          // quoteSummary 已移除，始终为空
+    var optData     = results[1];  // 可能为 null
 
     // ---- 价格 ----
     if (chartData.price > 0) {
@@ -1810,33 +1785,21 @@ function fetchIVData(ticker, callback) {
 }
 
 function fetchEarningsDate(ticker, callback) {
+  // quoteSummary returns 401 on Vercel — use static calendar
   if (earningsCache[ticker] !== undefined) { callback(earningsCache[ticker]); return; }
-  fetch('/api/q1/v10/finance/quoteSummary/' + ticker + '?modules=calendarEvents', { headers: yahooHeaders })
-    .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-    .then(function(d) {
-      var result = null;
-      if (d.quoteSummary && d.quoteSummary.result && d.quoteSummary.result[0]) {
-        var cal = d.quoteSummary.result[0].calendarEvents;
-        if (cal && cal.earnings && cal.earnings.earningsDate && cal.earnings.earningsDate[0]) {
-          var ts = cal.earnings.earningsDate[0].raw;
-          if (ts) {
-            result = { date: new Date(ts * 1000), days: Math.round((ts - Date.now() / 1000) / 86400), isReal: true };
-          }
-        }
-      }
-      earningsCache[ticker] = result;
-      callback(result);
-    })
-    .catch(function() { earningsCache[ticker] = null; callback(null); });
+  var EARNINGS_CAL = {
+    'AAPL':'2025-07-30','MSFT':'2025-07-29','AMZN':'2025-07-31',
+    'GOOGL':'2025-07-29','META':'2025-07-30','NVDA':'2025-08-27',
+    'TSLA':'2025-07-22','SMCI':'2025-08-05','RKLB':'2025-08-04',
+    'DRAM':null,'QQQ':null,'SPY':null
+  };
+  var dateStr = EARNINGS_CAL[ticker] || null;
+  var ts = dateStr ? Math.floor(new Date(dateStr).getTime()/1000) : null;
+  earningsCache[ticker] = ts;
+  callback(ts);
 }
 
-// Historical move data (genuine historical averages — these are based on realized moves)
-var HIST_MOVES = {
-  TSLA: 9.8, AMZN: 7.2, SMCI: 15.3, MSFT: 4.1, AAPL: 4.7, GOOGL: 5.8, META: 9.3, NVDA: 8.6,
-  QQQ: 2.1, SPY: 1.2, RKLB: 18.0, DRAM: 6.0
-};
 
-// ---- Scanner ----
 function renderScanner() {
   // ---- IV Rank List: use chart API (CORS ok) not options API (401 on Vercel) ----
   var listEl = document.getElementById('ivRankList');
@@ -1919,13 +1882,19 @@ function renderScanner() {
   earList.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">⟳ 正在加载财报日期…</div>';
   var earResults = []; var earDone = 0;
 
+  // Static earnings calendar — update quarterly
+  var EARNINGS_CAL = {
+    'AAPL':  '2025-07-30', 'MSFT':  '2025-07-29', 'AMZN':  '2025-07-31',
+    'GOOGL': '2025-07-29', 'META':  '2025-07-30', 'NVDA':  '2025-08-27',
+    'TSLA':  '2025-07-22', 'SMCI':  '2025-08-05', 'RKLB':  '2025-08-04',
+    'QQQ':   null,          'DRAM':  null
+  };
+
   function processEar(tk, sumData) {
     var earTs = null;
-    if (sumData && sumData.quoteSummary && sumData.quoteSummary.result && sumData.quoteSummary.result[0]) {
-      var cal = sumData.quoteSummary.result[0].calendarEvents;
-      if (cal && cal.earnings && cal.earnings.earningsDate && cal.earnings.earningsDate[0]) {
-        earTs = cal.earnings.earningsDate[0].raw;
-      }
+    // Try static calendar first
+    if (EARNINGS_CAL[tk]) {
+      earTs = Math.floor(new Date(EARNINGS_CAL[tk]).getTime() / 1000);
     }
     var days = earTs ? Math.round((earTs - Date.now()/1000) / 86400) : null;
     if (days === null || days < 0 || days > 30) { earDone++; checkEarDone(); return; }
@@ -1963,15 +1932,8 @@ function renderScanner() {
     earList.innerHTML = h2;
   }
 
-  function fetchNextEar(idx) {
-    if (idx >= earTickers.length) return;
-    var tk = earTickers[idx];
-    fetch('/api/q1/v10/finance/quoteSummary/' + tk + '?modules=calendarEvents')
-      .then(function(r){return r.json();}).catch(function(){return null;})
-      .then(function(d){ processEar(tk, d); })
-      .finally(function(){ setTimeout(function(){fetchNextEar(idx+1);}, 300); });
-  }
-  fetchNextEar(0);
+  // No network requests - use static earnings calendar (quoteSummary 401 on Vercel)
+  earTickers.forEach(function(tk) { processEar(tk, null); });
 }
 
 function renderArbScanner() {
