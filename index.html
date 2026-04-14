@@ -1807,27 +1807,27 @@ var HIST_MOVES = {
 
 // ---- Scanner ----
 function renderScanner() {
-  // ---- IV Rank: fetch real ATM IV from options chain for each ticker ----
-  var scanTickers = [
-    {ticker:'SMCI', name:'Super Micro'},
-    {ticker:'RKLB', name:'Rocket Lab'},
-    {ticker:'TSLA', name:'Tesla'},
-    {ticker:'DRAM', name:'DRAM'},
-    {ticker:'MSFT', name:'Microsoft'},
-    {ticker:'AAPL', name:'Apple'},
-    {ticker:'QQQ',  name:'Invesco QQQ'},
-    {ticker:'AMZN', name:'Amazon'}
-  ];
+  // ---- IV Rank: fetch sequentially with delay to avoid 401 rate limit ----
+  var scanTickers = userTickers.slice(0, 8).map(function(tk) {
+    return {ticker: tk, name: (TICKERS[tk] && TICKERS[tk].name) || tk};
+  });
   var listEl = document.getElementById('ivRankList');
   listEl.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">⟳ 正在拉取实时IV…</div>';
   var ivResults = []; var ivDone = 0;
 
-  scanTickers.forEach(function(t) {
-    fetch('/api/q2/v7/finance/options/' + t.ticker)
+  // Sequential with 300ms delay to avoid Yahoo rate limit
+  function fetchNextIV(idx) {
+    if (idx >= scanTickers.length) return;
+    var t = scanTickers[idx];
+    fetch('/api/q1/v7/finance/options/' + t.ticker)
       .then(function(r) { return r.json(); })
       .then(function(d) { pushIV(t, d, true); })
-      .catch(function()  { pushIV(t, null, false); });
-  });
+      .catch(function()  { pushIV(t, null, false); })
+      .finally(function() {
+        setTimeout(function() { fetchNextIV(idx + 1); }, 350);
+      });
+  }
+  fetchNextIV(0);
 
   function pushIV(t, d, fetched) {
     var iv = null, price = 0;
@@ -1950,20 +1950,14 @@ function renderVolRatio() {
   el.innerHTML = html;
 }
 
-// ---- Earnings: parallel fetch summary + options IV ----
-  var earTickers = ['TSLA','AMZN','SMCI','MSFT','AAPL','GOOGL','META','NVDA'];
+// ---- Earnings: sequential fetch with delay to avoid 401 ----
+  var earTickers = userTickers.concat(['GOOGL','META','NVDA']).filter(function(t,i,a){return a.indexOf(t)===i;}).slice(0,10);
   var earList = document.getElementById('earningsList');
   earList.innerHTML = '<div style="text-align:center;padding:20px;color:var(--tx3);font-size:11px">⟳ 正在加载财报日期…</div>';
   var earResults = []; var earDone = 0;
 
-  earTickers.forEach(function(tk) {
-    Promise.all([
-      fetch('/api/q1/v10/finance/quoteSummary/' + tk + '?modules=calendarEvents')
-        .then(function(r) { return r.json(); }).catch(function() { return null; }),
-      fetch('/api/q2/v7/finance/options/' + tk)
-        .then(function(r) { return r.json(); }).catch(function() { return null; })
-    ]).then(function(res) {
-      var sumData = res[0], optData = res[1];
+  function processEarTicker(tk, sumData, optData) {
+      var sumData = sumData, optData = optData;
       var earTs = null, iv = null, price = 0;
       if (sumData && sumData.quoteSummary && sumData.quoteSummary.result && sumData.quoteSummary.result[0]) {
         var cal = sumData.quoteSummary.result[0].calendarEvents;
@@ -2019,8 +2013,24 @@ function renderVolRatio() {
         if (!h2) h2 = '<div style="text-align:center;padding:20px;color:var(--tx3)">暂无近期财报</div>';
         earList.innerHTML = h2;
       }
+  }
+  function fetchNextEar(idx) {
+    if (idx >= earTickers.length) return;
+    var tk = earTickers[idx];
+    Promise.all([
+      fetch('/api/q1/v10/finance/quoteSummary/' + tk + '?modules=calendarEvents')
+        .then(function(r){return r.json();}).catch(function(){return null;}),
+      fetch('/api/q1/v7/finance/options/' + tk)
+        .then(function(r){return r.json();}).catch(function(){return null;})
+    ]).then(function(res) {
+      processEarTicker(tk, res[0], res[1]);
+    }).catch(function() {
+      processEarTicker(tk, null, null);
+    }).finally(function() {
+      setTimeout(function(){fetchNextEar(idx+1);}, 400);
     });
-  });
+  }
+  fetchNextEar(0);
 }
 
 // ---- Unusual activity — corrected classification with DTE awareness ----
