@@ -1176,17 +1176,23 @@ function fetchOptionsViaServer(ticker) {
             return r.json();
           })
           .then(function(d) {
+            var calls = (d.calls || []).map(wrapOptContract);
+            var puts  = (d.puts  || []).map(wrapOptContract);
+            if (!calls.length && !puts.length) return null;
             return {
-              expTs: dateStrToUnix(dateStr),
+              expTs: dateStrToUnix(d.expirationDate || dateStr),
               option: {
-                calls: (d.calls || []).map(wrapOptContract),
-                puts:  (d.puts  || []).map(wrapOptContract)
+                calls: calls,
+                puts:  puts
               }
             };
-          });
+          })
+          .catch(function() { return null; });
       }));
     })
     .then(function(details) {
+      details = details.filter(Boolean);
+      if (!details.length) throw new Error('server options details empty');
       details.sort(function(a, b) { return a.expTs - b.expTs; });
       return {
         data: {
