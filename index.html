@@ -1168,27 +1168,30 @@ function fetchOptionsViaServer(ticker) {
       if (!listData || !listData.expirationDates || !listData.expirationDates.length) {
         throw new Error('server options list empty');
       }
-      var expDates = listData.expirationDates.slice(0, 12);
-      return Promise.all(expDates.map(function(dateStr) {
-        return fetch('/api/options?symbol=' + encodeURIComponent(ticker) + '&date=' + encodeURIComponent(dateStr))
-          .then(function(r) {
-            if (!r.ok) throw new Error('server option detail ' + r.status);
-            return r.json();
-          })
-          .then(function(d) {
-            var calls = (d.calls || []).map(wrapOptContract);
-            var puts  = (d.puts  || []).map(wrapOptContract);
-            if (!calls.length && !puts.length) return null;
-            return {
-              expTs: dateStrToUnix(d.expirationDate || dateStr),
-              option: {
-                calls: calls,
-                puts:  puts
-              }
-            };
-          })
-          .catch(function() { return null; });
-      }));
+      var expDates = listData.expirationDates.slice(0, 8);
+      return expDates.reduce(function(chain, dateStr) {
+        return chain.then(function(acc) {
+          return fetch('/api/options?symbol=' + encodeURIComponent(ticker) + '&date=' + encodeURIComponent(dateStr))
+            .then(function(r) {
+              if (!r.ok) throw new Error('server option detail ' + r.status);
+              return r.json();
+            })
+            .then(function(d) {
+              var calls = (d.calls || []).map(wrapOptContract);
+              var puts  = (d.puts  || []).map(wrapOptContract);
+              if (!calls.length && !puts.length) return acc;
+              acc.push({
+                expTs: dateStrToUnix(d.expirationDate || dateStr),
+                option: {
+                  calls: calls,
+                  puts:  puts
+                }
+              });
+              return acc;
+            })
+            .catch(function() { return acc; });
+        });
+      }, Promise.resolve([]));
     })
     .then(function(details) {
       details = details.filter(Boolean);
