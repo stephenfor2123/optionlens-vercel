@@ -1131,9 +1131,74 @@ function fetchChart(ticker) {
 // fetchSummary removed — quoteSummary returns 401 on Vercel IPs
 // marketCap/name comes from chart API; earnings from static calendar
 
-// ---- 期权链：直连 v7 options (需要 crumb) ----
-// Yahoo 的 v7/options 要求请求带 crumb 参数，crumb 值从浏览器 cookie 里读。
-// 我们先尝试无 crumb 的请求（有时能过），失败则用 chart API 数据推算。
+// ---- 期权链：优先直连 Yahoo，失败时回退到自建 /api/options ----
+// Yahoo 的 v7/options 在 Vercel 上经常因为 Invalid Crumb 返回 401，
+// 所以这里保留直连作为首选，但必须有稳定的后备链路。
+function wrapOptNum(v) {
+  return v == null || isNaN(v) ? null : {raw: Number(v), fmt: String(v)};
+}
+
+function wrapOptContract(c) {
+  return {
+    strike:            wrapOptNum(c.strike),
+    lastPrice:         wrapOptNum(c.lastPrice),
+    bid:               wrapOptNum(c.bid),
+    ask:               wrapOptNum(c.ask),
+    change:            wrapOptNum(c.change),
+    percentChange:     wrapOptNum(c.percentChange),
+    volume:            wrapOptNum(c.volume),
+    openInterest:      wrapOptNum(c.openInterest),
+    impliedVolatility: wrapOptNum(c.impliedVolatility),
+    inTheMoney:        !!c.inTheMoney,
+    contractSymbol:    c.contractSymbol || ''
+  };
+}
+
+function dateStrToUnix(dateStr) {
+  return Math.floor(new Date(dateStr + 'T00:00:00Z').getTime() / 1000);
+}
+
+function fetchOptionsViaServer(ticker) {
+  return fetch('/api/options?symbol=' + encodeURIComponent(ticker))
+    .then(function(r) {
+      if (!r.ok) throw new Error('server options list ' + r.status);
+      return r.json();
+    })
+    .then(function(listData) {
+      if (!listData || !listData.expirationDates || !listData.expirationDates.length) {
+        throw new Error('server options list empty');
+      }
+      var expDates = listData.expirationDates.slice(0, 12);
+      return Promise.all(expDates.map(function(dateStr) {
+        return fetch('/api/options?symbol=' + encodeURIComponent(ticker) + '&date=' + encodeURIComponent(dateStr))
+          .then(function(r) {
+            if (!r.ok) throw new Error('server option detail ' + r.status);
+            return r.json();
+          })
+          .then(function(d) {
+            return {
+              expTs: dateStrToUnix(dateStr),
+              option: {
+                calls: (d.calls || []).map(wrapOptContract),
+                puts:  (d.puts  || []).map(wrapOptContract)
+              }
+            };
+          });
+      }));
+    })
+    .then(function(details) {
+      details.sort(function(a, b) { return a.expTs - b.expTs; });
+      return {
+        data: {
+          expirationDates: details.map(function(x) { return x.expTs; }),
+          options: details.map(function(x) { return x.option; }),
+          quote: null
+        },
+        source: 'Vercel server options fallback'
+      };
+    });
+}
+
 function fetchOptions(ticker) {
   // Primary: fetch default expiries
   var urlDirect = '/api/q2/v7/finance/options/' + ticker;
@@ -1160,6 +1225,9 @@ function fetchOptions(ticker) {
           }
           throw new Error('q1 empty');
         });
+    })
+    .catch(function() {
+      return fetchOptionsViaServer(ticker);
     })
     .catch(function() { return null; });
 }
